@@ -1,14 +1,19 @@
+import { createHmac, timingSafeEqual } from 'crypto';
+
 /**
  * Replay prevention for webhook event deduplication.
  *
  * Stores processed event IDs in a bounded in-memory map with TTL-based
  * eviction. Events older than the replay window are automatically removed.
+ * Supports signed webhook timestamp enforcement for replay-window validation.
  */
 
 export interface ReplayStore {
   has(eventId: string): boolean;
   add(eventId: string): void;
   cleanup(): void;
+  isTimestampWithinWindow(timestamp: string, toleranceSeconds?: number): boolean;
+  validateSignedWindow(eventId: string, timestamp: string, signature: string, secret: string, toleranceSeconds?: number): boolean;
 }
 
 export class MemoryReplayStore implements ReplayStore {
@@ -51,5 +56,35 @@ export class MemoryReplayStore implements ReplayStore {
 
   get size(): number {
     return this.entries.size;
+  }
+
+  isTimestampWithinWindow(timestamp: string, toleranceSeconds?: number): boolean {
+    const tolerance = toleranceSeconds ?? 300; // 5 minutes default
+    const ts = Number(timestamp);
+    if (!Number.isFinite(ts)) return false;
+    const age = Math.abs(Date.now() / 1000 - ts);
+    return age <= tolerance;
+  }
+
+  validateSignedWindow(eventId: string, timestamp: string, signature: string, secret: string, toleranceSeconds?: number): boolean {
+    // Verify timestamp is within tolerance window
+    if (!this.isTimestampWithinWindow(timestamp, toleranceSeconds ?? 300)) {
+      return false;
+    }
+
+    // Verify signature matches timestamp + eventId
+    try {
+      const expected = createHmac('sha256', secret)
+        .update(timestamp + '.' + eventId)
+        .digest('hex');
+
+      if (expected.length !== signature.length) {
+        return false;
+      }
+
+      return timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
+    } catch {
+      return false;
+    }
   }
 }

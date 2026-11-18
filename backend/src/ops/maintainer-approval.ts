@@ -124,6 +124,23 @@ export interface ActionFreezeGuard {
   }): unknown;
 }
 
+export interface PreviewResult {
+  intentId: string;
+  action: string;
+  target: string;
+  wouldSucceed: boolean;
+  prediction: {
+    affectedRecords?: number;
+    summary?: string;
+    estimatedDuration?: number;
+    potentialIssues?: string[];
+  };
+  requiredApprovals: boolean;
+  riskAssessment?: RiskAssessment | null;
+}
+
+export type PreviewExecutor = (intent: MaintainerIntent) => Promise<PreviewResult['prediction']>;
+
 export interface ApprovalServiceOptions {
   secret: string;
   now?: () => Date;
@@ -144,6 +161,7 @@ export class MaintainerApprovalService {
   private readonly intents = new Map<string, MaintainerIntent>();
   private readonly receipts: IntentReceipt[] = [];
   private readonly executors = new Map<string, ActionExecutor>();
+  private readonly previewExecutors = new Map<string, PreviewExecutor>();
   private readonly now: () => Date;
   private readonly actions: Record<string, HighImpactActionSpec>;
   private readonly risk: RiskScorer | null;
@@ -164,8 +182,61 @@ export class MaintainerApprovalService {
     this.executors.set(action, executor);
   }
 
+  registerPreviewExecutor(action: string, executor: PreviewExecutor): void {
+    if (!this.actions[action]) throw new Error(`Unknown high-impact action ${action}`);
+    this.previewExecutors.set(action, executor);
+  }
+
   isHighImpact(action: string): boolean {
     return Boolean(this.actions[action]);
+  }
+
+  async preview(id: string): Promise<PreviewResult> {
+    const intent = this.load(id);
+    const spec = this.actions[intent.action];
+    const previewExecutor = this.previewExecutors.get(intent.action);
+
+    if (!previewExecutor) {
+      return {
+        intentId: intent.id,
+        action: intent.action,
+        target: intent.target,
+        wouldSucceed: false,
+        prediction: {
+          summary: 'No preview executor registered for this action',
+          potentialIssues: ['Cannot generate preview without executor'],
+        },
+        requiredApprovals: spec.requiresSecondApprover || intent.risk?.requiresSecondApprover === true,
+        riskAssessment: intent.risk,
+      };
+    }
+
+    try {
+      const prediction = await previewExecutor({ ...intent });
+      return {
+        intentId: intent.id,
+        action: intent.action,
+        target: intent.target,
+        wouldSucceed: true,
+        prediction,
+        requiredApprovals: spec.requiresSecondApprover || intent.risk?.requiresSecondApprover === true,
+        riskAssessment: intent.risk,
+      };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return {
+        intentId: intent.id,
+        action: intent.action,
+        target: intent.target,
+        wouldSucceed: false,
+        prediction: {
+          summary: 'Preview simulation failed',
+          potentialIssues: [redactSecrets(message)],
+        },
+        requiredApprovals: spec.requiresSecondApprover || intent.risk?.requiresSecondApprover === true,
+        riskAssessment: intent.risk,
+      };
+    }
   }
 
   private sign(payload: string): string {
